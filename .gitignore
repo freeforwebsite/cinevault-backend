@@ -1,0 +1,16 @@
+# Telegram Session Files
+*.session
+*.session-journal
+
+# Python Virtual Environments
+venv/
+env/
+.env
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.idea/
+
+deploy_to_cloud.py
