@@ -173,12 +173,45 @@ async def search_movie(request: Request, query: str):
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
+active_downloads = {}
+
+async def background_downloader(client, bot_entity, message_id, document, file_path):
+    temp_path = file_path + ".tmp"
+    try:
+        with open(temp_path, "wb") as f:
+            async for chunk in client.iter_download(document):
+                f.write(chunk)
+        import os
+        os.rename(temp_path, file_path)
+    except Exception as e:
+        print(f"[!] Background download failed for {message_id}: {e}")
+        import os
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    finally:
+        if message_id in active_downloads:
+            del active_downloads[message_id]
+
 @app.get("/stream/{bot_username}/{message_id}")
 async def stream_telegram_file(request: Request, bot_username: str, message_id: int):
     try:
         target_peer = int(bot_username) if bot_username.lstrip('-').isdigit() else bot_username
-        bot_entity = await client.get_entity(target_peer)
-        msg_list = await client.get_messages(bot_entity, ids=[message_id])
+        
+        try:
+            bot_entity = await client.get_entity(target_peer)
+            msg_list = await client.get_messages(bot_entity, ids=[message_id])
+        except Exception as e:
+            import traceback
+            print(f"[!] STREAM ENDPOINT ERROR: {repr(e)}")
+            traceback.print_exc()
+            if "disconnect" in str(e).lower() or not client.is_connected():
+                print("[!] Telethon connection lost! Reconnecting...")
+                await client.connect()
+                bot_entity = await client.get_entity(target_peer)
+                msg_list = await client.get_messages(bot_entity, ids=[message_id])
+            else:
+                raise HTTPException(status_code=500, detail=f"Error: {repr(e)}")
+                
         msg = msg_list[0] if msg_list else None
         
         if not msg or not msg.document:
@@ -186,6 +219,19 @@ async def stream_telegram_file(request: Request, bot_username: str, message_id: 
             
         document = msg.document
         file_size = document.size
+        
+        # Cache Setup
+        import os
+        import asyncio
+        cache_dir = "temp_cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        file_path = os.path.join(cache_dir, f"{message_id}.mp4")
+        temp_path = file_path + ".tmp"
+        
+        # Trigger background download if not already cached/downloading
+        if not os.path.exists(file_path) and message_id not in active_downloads:
+            active_downloads[message_id] = True
+            asyncio.create_task(background_downloader(client, bot_entity, message_id, document, file_path))
         
         range_header = request.headers.get("Range", "bytes=0-")
         start_byte = 0
@@ -201,26 +247,62 @@ async def stream_telegram_file(request: Request, bot_username: str, message_id: 
         async def file_generator():
             downloaded = 0
             length_to_download = end_byte - start_byte + 1
-            async for chunk in client.iter_download(document, offset=start_byte):
-                if downloaded + len(chunk) > length_to_download:
-                    yield bytes(chunk[:length_to_download - downloaded])
-                    break
-                yield bytes(chunk)
-                downloaded += len(chunk)
+            target_path = file_path if os.path.exists(file_path) else temp_path
+            
+            # Step 1: Serve from local cache disk if the bytes are available
+            if os.path.exists(target_path) and start_byte < os.path.getsize(target_path):
+                with open(target_path, "rb") as f:
+                    f.seek(start_byte)
+                    while downloaded < length_to_download:
+                        chunk_size = min(1024 * 1024, length_to_download - downloaded)
+                        chunk = f.read(chunk_size)
+                        
+                        if chunk:
+                            yield chunk
+                            downloaded += len(chunk)
+                        else:
+                            # Reached EOF on disk
+                            if message_id in active_downloads:
+                                await asyncio.sleep(0.5) # Wait for downloader to fetch more
+                            else:
+                                break # Downloader finished or crashed, fallback to Telegram stream
+                                
+            # Step 2: Fallback to direct Telegram stream for remaining bytes (like seeking to the end)
+            if downloaded < length_to_download:
+                remaining_offset = start_byte + downloaded
+                async for chunk in client.iter_download(document, offset=remaining_offset):
+                    if downloaded + len(chunk) > length_to_download:
+                        yield bytes(chunk[:length_to_download - downloaded])
+                        break
+                    yield bytes(chunk)
+                    downloaded += len(chunk)
+                
+        # Determine correct MIME type (ExoPlayer fails if we send video/mp4 for an MKV file)
+        mime_type = document.mime_type or "application/octet-stream"
+        
+        # Check attributes for the real filename
+        for attr in document.attributes:
+            if hasattr(attr, 'file_name') and attr.file_name:
+                if attr.file_name.lower().endswith(".mkv"):
+                    mime_type = "video/x-matroska"
+                elif attr.file_name.lower().endswith(".mp4"):
+                    mime_type = "video/mp4"
+                break
                 
         headers = {
             "Accept-Ranges": "bytes",
             "Content-Range": f"bytes {start_byte}-{end_byte}/{file_size}",
             "Content-Length": str(end_byte - start_byte + 1),
-            "Content-Type": "video/mp4"
+            "Content-Type": mime_type
         }
         
-        return StreamingResponse(file_generator(), status_code=206, headers=headers, media_type="video/mp4")
+        return StreamingResponse(file_generator(), status_code=206, headers=headers, media_type=mime_type)
     except Exception as e:
-        print(f"Stream ERROR: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        print(f"Stream ERROR REPR: {repr(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Outer Error: {repr(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=8005, reload=False)
