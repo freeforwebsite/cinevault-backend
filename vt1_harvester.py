@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import io
+import time
 import google.generativeai as genai
 from datetime import datetime
 import motor.motor_asyncio
@@ -23,9 +24,10 @@ API_ID = 31654968
 API_HASH = 'b00f22e26a8c38db4172ce84f7d96ae2'
 HARDCODED_SESSION = "1BVtsOLkBu5JeC5sPJ_3ZAay5Xlhypv-6MSBYCjeaXb6PswozZwlkaoBJm1_xqFkkqsT5rznnbt0-0O79dRxM87wc2ZWWI8ZvsWGkcmteEgAWCyX_n7F4iESRiUA7lqpLHqawrxj8fR8GYs7Kkd4mwtrhTo_sFoyT5tUoACMuPWL9UTZc1QToIR1VYTR3Arbbw113nzorwflmVQIT0oDoZ-YjbAJEQxoCYp7JZrsq-iwVc0kdFgDw8a35CBzPnqTeLfjRl4lBV182IFtS_ne2LAT-pi8jDcKy7RdAsHjeFbXqAGofFbolkJxavHvX3aVgSAm8InBFysOzggO-nZie0smGZiD1_iw="
 SESSION_STRING = os.environ.get('TELEGRAM_SESSION_STRING', HARDCODED_SESSION)
+SESSION_STRING_2 = os.environ.get('TELEGRAM_SESSION_STRING_2', "")
 
 # We will set this when the user creates the channel
-DB1_CHANNEL_ID = "https://t.me/+I9jiBz3SjvRlNjNl"
+DB1_CHANNEL_ID = -1004413411497
 
 SEARCH_BOT = "@Cineplexmovreqbot"
 
@@ -49,7 +51,11 @@ attempted_join_links = set()
 
 REPORT_BOT_TOKEN = os.environ.get("REPORT_BOT_TOKEN", "8727236866:AAFNtEftX_80eO1C3hzLq13O7nMWJISvgeM")
 REQUEST_BOT_TOKEN = os.environ.get("REQUEST_BOT_TOKEN", "8888137591:AAHq-PiTZ0kR1k8tElTU8YcITKjCCMUbjDE")
-MONGO_URI = "mongodb+srv://freeforwebsitein_db_user:PQWHxVtcA1NnOqVO@cluster0.knj55zu.mongodb.net"
+# MongoDB Configuration
+MONGO_URI = "mongodb+srv://dharani2006lakshmi_db_user:Byi5WDiKV6H53Xe1@cluster0.p93dbly.mongodb.net"
+client_mongo = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+db = client_mongo["cinevault"]
+harvester_collection = db["harvester_memory"]
 
 if not SESSION_STRING:
     cprint("[!] ERROR: TELEGRAM_SESSION_STRING environment variable not set.")
@@ -270,7 +276,8 @@ async def process_quality_link(quality, q_url, movie, language):
                     target = db1_entity if db1_entity else DB1_CHANNEL_ID
                     cprint(f"[*] Forwarding file to DB1...")
                     try:
-                        await c.send_message(target, file=media_msg.media, message=caption)
+                        sent_msg = await c.send_message(target, file=media_msg.media, message=caption)
+                        file_size_gb = (media_msg.media.document.size / (1024 * 1024 * 1024)) if hasattr(media_msg.media, 'document') else 0
                         cprint(f"[+] Successfully saved {quality} ({language}) to DB1!")
                     except telethon.errors.FloodWaitError as e:
                         cprint(f"[!!!] FloodWaitError sending to DB1! Sleeping {e.seconds}s...")
@@ -282,13 +289,18 @@ async def process_quality_link(quality, q_url, movie, language):
                     
                     if mongo_db is not None:
                         try:
-                            await mongo_db.uploaded_movies.insert_one({
-                                "tmdb_id": movie['id'],
-                                "title": movie['title'],
-                                "quality": quality,
-                                "language": language,
-                                "timestamp": datetime.utcnow()
-                            })
+                            # Save to harvester_memory so the /search endpoint can find it
+                            await mongo_db.harvester_memory.update_one(
+                                {"tmdb_id": movie['id'], "quality": quality},
+                                {"$set": {
+                                    "title": movie['title'],
+                                    "language": language,
+                                    "message_id": sent_msg.id,
+                                    "file_size": file_size_gb,
+                                    "timestamp": datetime.utcnow()
+                                }},
+                                upsert=True
+                            )
                         except Exception as e:
                             cprint(f"[-] MongoDB upload save failed: {e}")
                             
@@ -676,9 +688,38 @@ async def run_harvester(external_client=None):
     global current_status
     current_status = "Starting Harvester Loop..."
     
+    # Dual-Account Setup
+    active_account = 1
+    last_rotation_time = time.time()
+    
     # We run this in an infinite loop for Render deployment!
     while True:
         try:
+            # Check for Account Rotation (5 hours = 18000 seconds)
+            if SESSION_STRING_2 and (time.time() - last_rotation_time > 18000):
+                cprint("\n[!] 5 HOURS PASSED! ROTATING ACCOUNTS TO PREVENT SPAM BAN...")
+                current_status = "Rotating Accounts..."
+                
+                # Disconnect current client safely
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                    
+                # Swap Session String
+                if active_account == 1:
+                    new_session = SESSION_STRING_2
+                    active_account = 2
+                else:
+                    new_session = SESSION_STRING
+                    active_account = 1
+                    
+                # Reconnect
+                client = TelegramClient(StringSession(new_session), API_ID, API_HASH)
+                await client.connect()
+                cprint(f"[+] Successfully hot-swapped to Account {active_account}!")
+                last_rotation_time = time.time()
+                
             current_status = "Fetching TMDB movies..."
             movies = await fetch_tmdb_movies(pages=50) # Fetch movies
             if not movies:
