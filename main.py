@@ -14,10 +14,20 @@ session_name = 'lyra_userbot_session'
 HARDCODED_SESSION = "1BVtsOLkBu5JeC5sPJ_3ZAay5Xlhypv-6MSBYCjeaXb6PswozZwlkaoBJm1_xqFkkqsT5rznnbt0-0O79dRxM87wc2ZWWI8ZvsWGkcmteEgAWCyX_n7F4iESRiUA7lqpLHqawrxj8fR8GYs7Kkd4mwtrhTo_sFoyT5tUoACMuPWL9UTZc1QToIR1VYTR3Arbbw113nzorwflmVQIT0oDoZ-YjbAJEQxoCYp7JZrsq-iwVc0kdFgDw8a35CBzPnqTeLfjRl4lBV182IFtS_ne2LAT-pi8jDcKy7RdAsHjeFbXqAGofFbolkJxavHvX3aVgSAm8InBFysOzggO-nZie0smGZiD1_iw="
 session_string = os.environ.get('TELEGRAM_SESSION_STRING', HARDCODED_SESSION)
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, restrict this to your Admin WebApp's URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # MongoDB
-MONGO_URI = "mongodb+srv://freeforwebsitein_db_user:PQWHxVtcA1NnOqVO@cluster0.knj55zu.mongodb.net"
+MONGO_URI = "mongodb+srv://dharani2006lakshmi_db_user:Byi5WDiKV6H53Xe1@cluster0.p93dbly.mongodb.net"
 mongo_db = None
 if MONGO_URI:
     mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
@@ -30,8 +40,32 @@ async def root():
 
 @app.get("/status")
 def read_status():
-    import vt1_harvester
-    return {"status": "running", "current_task": vt1_harvester.current_status}
+    return {"status": "running"}
+
+@app.get("/search")
+async def search_movies(q: str):
+    if mongo_db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+    
+    collection = mongo_db["harvester_memory"]
+    
+    # Case-insensitive regex search on the title
+    query = {"title": {"$regex": q, "$options": "i"}}
+    
+    results = []
+    # Limit to top 20 results to avoid massive payload
+    cursor = collection.find(query).limit(20)
+    
+    async for doc in cursor:
+        results.append({
+            "id": str(doc.get("_id", "")),
+            "title": doc.get("title", "Unknown"),
+            "message_id": doc.get("message_id", 0),
+            "quality": doc.get("quality", "Unknown"),
+            "file_size": doc.get("file_size", 0)
+        })
+        
+    return {"results": results}
 
 client = None
 
@@ -54,8 +88,8 @@ async def startup_event():
         return
     
     # Run the VT1 Harvester as a background task sharing this exact client!
-    from vt1_harvester import run_harvester
-    asyncio.create_task(run_harvester(client))
+    # from vt1_harvester import run_harvester
+    # asyncio.create_task(run_harvester(client))
     
     print("[*] Successfully hooked into Telegram!")
 
@@ -117,58 +151,6 @@ async def fetch_movie_on_demand(request: Request):
     else:
         raise HTTPException(status_code=404, detail=f"Could not fetch '{title} {year}' from any bot.")
 
-@app.get("/search")
-async def search_movie(request: Request, query: str):
-    if not await client.is_user_authorized():
-        raise HTTPException(status_code=401, detail="Telegram session not authorized.")
-    
-    try:
-        print(f"[*] Native DB1 Search for: {query}")
-        db1 = await client.get_entity(DB1_CHANNEL_ID)
-        
-        streams = []
-        render_url = str(request.base_url).rstrip("/")
-        
-        # Search the database channel
-        async for msg in client.iter_messages(db1, search=query, limit=10):
-            if msg.media and hasattr(msg.media, 'document') and msg.text:
-                text = msg.text.lower()
-                
-                # Extract quality from the caption (e.g., 💿 Quality: 1080p)
-                quality = "Unknown"
-                if "1080p" in text: quality = "1080p"
-                elif "720p" in text: quality = "720p"
-                elif "480p" in text or "360p" in text: quality = "480p"
-                
-                # We assume VT1 prioritized Tamil, or fallback to English
-                language = "TAMIL" if "tamil" in text else "ENGLISH"
-                
-                file_size_gb = msg.media.document.size / (1024 * 1024 * 1024)
-                
-                # The stream peer is DB1, and message ID is the message in DB1
-                stream_peer = db1.id
-                stream_msg_id = msg.id
-                
-                final_stream_url = f"{render_url}/stream/{stream_peer}/{stream_msg_id}"
-                
-                streams.append({
-                    "quality": quality,
-                    "language": language,
-                    "size": f"{file_size_gb:.2f} GB",
-                    "url": final_stream_url,
-                    "rawText": "Native DB1 Stream"
-                })
-        
-        if not streams:
-            print(f"[-] No results found in DB1 for {query}")
-            return JSONResponse({"streams": []})
-            
-        print(f"[*] Found {len(streams)} streams in DB1!")
-        return JSONResponse({"streams": streams})
-        
-    except Exception as e:
-         print(f"ERROR: {str(e)}")
-         raise HTTPException(status_code=500, detail=str(e))
 
 from fastapi import Request
 from fastapi.responses import StreamingResponse
@@ -182,17 +164,73 @@ async def background_downloader(client, bot_entity, message_id, document, file_p
             async for chunk in client.iter_download(document):
                 f.write(chunk)
         import os
-        os.rename(temp_path, file_path)
+        try:
+            os.rename(temp_path, file_path)
+        except Exception:
+            pass # Windows permission error if file is still open by a viewer, will remain as .tmp
     except Exception as e:
         print(f"[!] Background download failed for {message_id}: {e}")
         import os
         if os.path.exists(temp_path):
-            os.remove(temp_path)
+            try:
+                os.remove(temp_path)
+            except:
+                pass
     finally:
         if message_id in active_downloads:
             del active_downloads[message_id]
 
-@app.get("/stream/{bot_username}/{message_id}")
+@app.get("/inventory")
+async def get_inventory():
+    """Returns all harvested movies for the Admin WebApp."""
+    cursor = mongo_db.harvester_memory.find().sort("timestamp", -1)
+    movies = await cursor.to_list(length=1000)
+    
+    formatted = []
+    for m in movies:
+        formatted.append({
+            "id": str(m.get("tmdb_id", m.get("title", ""))),
+            "title": m.get("title", "Unknown"),
+            "poster": m.get("poster", ""),
+            "quality": m.get("quality", "HD"),
+            "language": m.get("language", "Unknown"),
+            "messageId": str(m.get("message_id", "")),
+            "tmdbId": m.get("tmdb_id")
+        })
+    return formatted
+
+@app.get("/storefront")
+async def get_storefront():
+    """
+    Returns the dynamic storefront configuration (list of rows) for the Android App.
+    Reads from the 'storefront_config' MongoDB collection.
+    """
+    config = await mongo_db.storefront_config.find_one({"_id": "master_config"})
+    if config and "rows" in config:
+        return config
+        
+    # Default fallback if admin hasn't configured anything yet
+    return {
+        "banners": [],
+        "rows": [
+            { "id": "default1", "title": "Storefront Empty", "movies": [] }
+        ]
+    }
+
+@app.post("/storefront")
+async def save_storefront(request: Request):
+    """
+    Saves the storefront configuration (list of rows) from the Admin WebApp.
+    """
+    data = await request.json()
+    await mongo_db.storefront_config.update_one(
+        {"_id": "master_config"},
+        {"$set": data},
+        upsert=True
+    )
+    return {"status": "success", "message": "Storefront saved."}
+
+@app.api_route("/stream/{bot_username}/{message_id}", methods=["GET", "HEAD"])
 async def stream_telegram_file(request: Request, bot_username: str, message_id: int):
     try:
         target_peer = int(bot_username) if bot_username.lstrip('-').isdigit() else bot_username
@@ -264,6 +302,7 @@ async def stream_telegram_file(request: Request, bot_username: str, message_id: 
                             # Reached EOF on disk
                             if message_id in active_downloads:
                                 await asyncio.sleep(0.5) # Wait for downloader to fetch more
+                                f.seek(f.tell()) # MUST reset EOF state in Python on Windows to read appended bytes!
                             else:
                                 break # Downloader finished or crashed, fallback to Telegram stream
                                 
