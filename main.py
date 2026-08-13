@@ -195,7 +195,9 @@ async def get_inventory():
             "quality": m.get("quality", "HD"),
             "language": m.get("language", "Unknown"),
             "messageId": str(m.get("message_id", "")),
-            "tmdbId": m.get("tmdb_id")
+            "tmdbId": m.get("tmdb_id"),
+            "fileId": m.get("file_id", ""),
+            "fileName": m.get("file_name", "")
         })
     return formatted
 
