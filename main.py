@@ -182,24 +182,45 @@ async def background_downloader(client, bot_entity, message_id, document, file_p
 
 @app.get("/inventory")
 async def get_inventory():
-    """Returns all harvested movies for the Admin WebApp."""
-    cursor = mongo_db.harvester_memory.find().sort("timestamp", -1)
+    """Returns all curated master movies for the Admin WebApp."""
+    cursor = mongo_db.curated_movies.find().sort([("_id", -1)]).limit(1000)
     movies = await cursor.to_list(length=1000)
     
     formatted = []
     for m in movies:
         formatted.append({
-            "id": str(m.get("tmdb_id", m.get("title", ""))),
+            "id": str(m.get("_id")),
             "title": m.get("title", "Unknown"),
             "poster": m.get("poster", ""),
-            "quality": m.get("quality", "HD"),
-            "language": m.get("language", "Unknown"),
-            "messageId": str(m.get("message_id", "")),
-            "tmdbId": m.get("tmdb_id"),
-            "fileId": m.get("file_id", ""),
-            "fileName": m.get("file_name", "")
+            "tmdbId": m.get("tmdbId"),
+            "streams": m.get("streams", [])
         })
     return formatted
+
+@app.post("/inventory/curated")
+async def save_curated_movie(request: Request):
+    """Saves a manually curated Master Movie to the inventory."""
+    data = await request.json()
+    
+    tmdb_id = data.get("tmdbId")
+    if not tmdb_id:
+        import uuid
+        tmdb_id = str(uuid.uuid4())
+        
+    movie_doc = {
+        "_id": str(tmdb_id),
+        "title": data.get("title", "Unknown"),
+        "poster": data.get("poster", ""),
+        "tmdbId": tmdb_id,
+        "streams": data.get("streams", [])
+    }
+    
+    await mongo_db.curated_movies.update_one(
+        {"_id": str(tmdb_id)},
+        {"$set": movie_doc},
+        upsert=True
+    )
+    return {"status": "success", "message": "Master Movie saved."}
 
 @app.get("/storefront")
 async def get_storefront():
