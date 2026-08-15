@@ -220,7 +220,27 @@ async def save_curated_movie(request: Request):
         {"$set": movie_doc},
         upsert=True
     )
-    return {"status": "success", "message": "Master Movie saved."}
+    
+    # Also sync the updated movie to the storefront configuration if it exists there
+    storefront = await mongo_db.storefront_config.find_one({"_id": "master_config"})
+    if storefront and "rows" in storefront:
+        updated = False
+        for row in storefront["rows"]:
+            for i, m in enumerate(row.get("movies", [])):
+                if m.get("id") == str(tmdb_id) or m.get("_id") == str(tmdb_id) or m.get("tmdbId") == str(tmdb_id):
+                    # We need to make sure 'id' is set for the frontend
+                    updated_movie = dict(movie_doc)
+                    updated_movie["id"] = str(tmdb_id)
+                    row["movies"][i] = updated_movie
+                    updated = True
+        
+        if updated:
+            await mongo_db.storefront_config.update_one(
+                {"_id": "master_config"},
+                {"$set": {"rows": storefront["rows"]}}
+            )
+
+    return {"status": "success", "message": "Master Movie saved and storefront synced."}
 
 @app.get("/storefront")
 async def get_storefront():
